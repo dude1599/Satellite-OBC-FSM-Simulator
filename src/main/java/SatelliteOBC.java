@@ -136,6 +136,8 @@ public class SatelliteOBC {
 								temperature = (short) Math.max(-10, temperature - 3);
 								break;
 							case EMERGENCY:
+								// 시스템은 꺼져있지만 태양광 패널로 인해 배터리를 천천히 충전
+								battery = (short) Math.min(100, battery + 1);
 								temperature = (short) Math.max(-10, temperature - 5);
 								break;
 						}
