@@ -3,6 +3,9 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Queue;
+import java.util.Random;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -21,7 +24,12 @@ public class SatelliteOBC {
 	private static volatile short battery = 100;		// 100%
 	private static volatile short temperature = 15;		// 15도
 
-
+	// 통신 두절 시 데이터를 보관할 플래시 메모리 (Queue)
+	private static final Queue<byte[]> flashMemory = new ConcurrentLinkedQueue<>();
+	private static final int MAX_MEMORY_CAPACITY = 100; // 최대 100개의 패킷만 보관
+	// 비정기적 통신 상태 시뮬레이션을 위한 변수
+	private static volatile boolean isCommunicationLost = false;
+	private static final Random random = new Random();
 
 	// 응답 패킷 전송용 메서드 추가 (ACK or NAK)
 	private static void sendResponse(DatagramSocket socket, InetAddress clientAddress, int clientPort, short seq, boolean isAck) {
@@ -58,47 +66,35 @@ public class SatelliteOBC {
 		}
 	}
 
-	// 1초마다 TM(상태 데이터)를 쏘는 함수
-	private static void sendTelemetry(DatagramSocket socket) {
-		try {
-			// Type 0x05 = TM, Payload는 4바이트(배터리 2 + 온도 2)
-			byte[] header = new byte[8];
-			ByteBuffer buffer = ByteBuffer.wrap(header);
-			buffer.order(ByteOrder.BIG_ENDIAN);
-			buffer.putShort((short) 0xCAFE);	// Magic : buffer.putShort() = 2바이트(16bit) 할당
-			buffer.put((byte) 0x01);			// Ver	 : buffer.put() = 1바이트(8bit) 할당
-			buffer.put((byte) 0x05); 			// TM Type : 0x05 = TM
-			buffer.putShort(tmSeq++); 			// 보낼 때마다 시퀀스 1씩 증가
+	// 패킷 데이터(byte 배열)만 만들어내는 함수 : 통신이 끊겼을 때 내부 메모리에 TM을 저장하기 위해 데이터 조립만 하는 함수로 변경.
+	private static byte[] buildTelemetryPacket() {
+		byte[] header = new byte[8];
+		ByteBuffer buffer = ByteBuffer.wrap(header);
+		buffer.order(ByteOrder.BIG_ENDIAN);
+		buffer.putShort((short) 0xCAFE);
+		buffer.put((byte) 0x01);
+		buffer.put((byte) 0x05);
+		buffer.putShort(tmSeq++);
+		buffer.putShort((short) 5);
 
-			buffer.putShort((short) 5); // Payload 길이 5바이트 : 배터리 2 + 온도 2 + 모드 1(Safe or Nominal)
+		ByteBuffer packetBuffer = ByteBuffer.allocate(15);
+		packetBuffer.order(ByteOrder.BIG_ENDIAN);
+		packetBuffer.put(header);
+		packetBuffer.putShort(battery);
+		packetBuffer.putShort(temperature);
 
+		byte modeByte = switch (currentState) {
+			case BOOT -> 0x40;
+			case SAFE -> 0x10;
+			case EMERGENCY -> 0x30;
+			case NOMINAL -> 0x20;
+		};
+		packetBuffer.put(modeByte);
 
-			// 총 15바이트 할당 (헤더 8 + 페이로드 5 + 마지막에 CRC 2)
-			ByteBuffer packetBuffer = ByteBuffer.allocate(15);
-			packetBuffer.order(ByteOrder.BIG_ENDIAN);
-			packetBuffer.put(header);       // 8byte 헤더 넣기
-			packetBuffer.putShort(battery); // 페이로드 1: 배터리(2 byte)
-			packetBuffer.putShort(temperature); // 페이로드 2: 온도(2 byte)
+		int crc = Crc16Utils.calculateCrc16Xmodem(packetBuffer.array(), 13);
+		packetBuffer.putShort((short) crc);
 
-			byte modeByte = switch (currentState) {
-				case BOOT -> 0x40;
-				case SAFE -> 0x10;
-				case EMERGENCY -> 0x30;
-				case NOMINAL -> 0x20;
-			};
-			packetBuffer.put(modeByte);
-
-			// 배열(13바이트)을 CRC 돌림
-			int crc = Crc16Utils.calculateCrc16Xmodem(packetBuffer.array(), 13);
-			packetBuffer.putShort((short) crc); // 끝에 CRC 붙이기 : 총 15바이트 완성
-
-			byte[] sendData = packetBuffer.array();
-			DatagramPacket tmPacket = new DatagramPacket(sendData, sendData.length, lastClientAddress, lastClientPort);
-			socket.send(tmPacket);
-
-		} catch (Exception e) {
-			log.error("TM 전송 중 오류: ", e);
-		}
+		return packetBuffer.array();
 	}
 
 	public static void main(String[] args) {
@@ -107,6 +103,31 @@ public class SatelliteOBC {
 		try (DatagramSocket socket = new DatagramSocket(port)) {
 			log.info("위성 시스템 시작 - 지상국 명령 대기 중... (Port: {})", port);
 
+			Thread faultInjectionThread = new Thread(() -> {
+				while (true) {
+					try {
+						// 10초 ~ 20초 사이 랜덤하게 정상 통신 유지
+						int normalDuration = 10000 + random.nextInt(10000);
+						Thread.sleep(normalDuration);
+
+						log.warn("💥 [장애 발생] 우주 방사선 영향으로 일시적인 통신 단절(LOS) 발생!");
+						isCommunicationLost = true;
+
+						// 3초 ~ 7초 사이 랜덤하게 통신 두절 유지
+						int lostDuration = 3000 + random.nextInt(4000);
+						Thread.sleep(lostDuration);
+
+						log.info("📡 [장애 복구] 통신 모듈 정상화 (AOS). 연결이 복구되었습니다.");
+						isCommunicationLost = false;
+
+					} catch (InterruptedException e) {
+						break;
+					}
+				}
+			});
+			faultInjectionThread.setDaemon(true);
+			faultInjectionThread.start();
+
 			// TM 주기적으로 쏘는 백그라운드 스레드 시작
 			Thread tmThread = new Thread(() -> {
 				int bootTimer = 0;
@@ -114,6 +135,7 @@ public class SatelliteOBC {
 					try {
 						Thread.sleep(1000); // 1초 대기
 
+						// FSM(Finite State Machine) 상태 변경 로직
 						switch (currentState) {
 							case BOOT:
 								bootTimer++;
@@ -143,7 +165,33 @@ public class SatelliteOBC {
 						}
 						// 지상국에서 데이터를 전송하여 주소를 알 때만 TM 전송.
 						if (lastClientAddress != null) {
-							sendTelemetry(socket);
+							byte[] currentTmData = buildTelemetryPacket(); // 1초마다 데이터 생성
+
+							// 통신 상태에 따른 처리 분기
+							if (isCommunicationLost) {
+								// 1. 통신 두절 (LOS) 상태: 전송하지 않고 메모리에 저장만 함
+								if (flashMemory.size() < MAX_MEMORY_CAPACITY) {
+									flashMemory.offer(currentTmData);
+									log.info("💾 [로깅 중] 전송 불가. 패킷을 플래시 메모리에 저장합니다. (저장된 개수: {})", flashMemory.size());
+								} else {
+									flashMemory.poll(); // 꽉 찼으면 오래된 TM 메세지 삭제
+									flashMemory.offer(currentTmData);
+								}
+							} else {
+								// 2. 통신 정상 (AOS) 상태:
+								// 만약 통신이 방금 복구되어서 메모리에 밀린 데이터가 있다면 먼저 전송
+								while (!flashMemory.isEmpty()) {
+									byte[] dumpData = flashMemory.poll();
+									DatagramPacket dumpPacket = new DatagramPacket(dumpData, dumpData.length, lastClientAddress, lastClientPort);
+									socket.send(dumpPacket);
+									log.info("📥 [DUMP] 저장된 과거 TM 데이터를 전송합니다. (남은 데이터: {})", flashMemory.size());
+									Thread.sleep(50); // 패킷이 너무 빨리 가서 파이썬 소켓 버퍼가 넘치는 것을 방지
+								}
+
+								// 밀린 걸 다 보냈거나 원래 밀린 게 없었다면, 현재 만든 데이터를 실시간으로 보냄
+								DatagramPacket tmPacket = new DatagramPacket(currentTmData, currentTmData.length, lastClientAddress, lastClientPort);
+								socket.send(tmPacket);
+							}
 						}
 					} catch (InterruptedException e) {
 						break; // 스레드 중단
@@ -152,7 +200,7 @@ public class SatelliteOBC {
 					}
 				}
 			});
-			tmThread.setDaemon(true); // 메인 스레드 종료 시 같이 죽도록 설정
+			tmThread.setDaemon(true); // 메인 스레드 종료 시 같이 쓰레드도 종료되도록 설정
 			tmThread.start();
 
 			byte[] receiveBuffer = new byte[1024];
@@ -200,6 +248,12 @@ public class SatelliteOBC {
 					continue;
 				}
 
+				// 통신 두절 시뮬레이션 중에는 지상국 명령(TC)도 무시
+				if (isCommunicationLost) {
+					log.warn("🚫 [통신 단절] 수신된 명령(Seq:{})을 처리할 수 없습니다.", seq);
+					continue;
+				}
+
 				// --- 정상 패킷 처리 ---
 				log.info("✅ 위성: CRC 일치! [정상 패킷 수신]");
 				log.info("Version: {}", ver);
@@ -210,11 +264,15 @@ public class SatelliteOBC {
 
 
 				if (type == (byte) 0x10) {
-					currentState = SatelliteState.SAFE;
-					log.info("📡 [TC] 지상국 명령: SAFE 모드 전환.");
+					if (currentState != SatelliteState.SAFE) {
+						currentState = SatelliteState.SAFE;
+						log.info("📡 [TC] 지상국 명령: SAFE 모드 전환.");
+					}
 				} else if (type == (byte) 0x20) {
-					currentState = SatelliteState.NOMINAL;
-					log.info("📡 [TC] 지상국 명령: NOMINAL 모드 전환.");
+					if (currentState != SatelliteState.NOMINAL) {
+						currentState = SatelliteState.NOMINAL;
+						log.info("📡 [TC] 지상국 명령: NOMINAL 모드 전환.");
+					}
 				}
 				log.info("현재 위성 상태: [{}]", currentState);
 
