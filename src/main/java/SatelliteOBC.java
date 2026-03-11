@@ -4,13 +4,24 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Queue;
-import java.util.Random;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * 위성 측 : OBS / Server
+ * 우주 위성 온보드 컴퓨터(OBC, On-Board Computer) 시뮬레이터 서버
+ * -UDP 소켓 통신을 기반으로 지상국과 데이터를 주고받으며, 우주 환경의 물리적 제약과
+ * -통신 장애 상황을 모사하는 3개의 독립적인 스레드로 구성.
+ * * [핵심 기능]
+ * 1. FSM (유한 상태 머신): BOOT, NOMINAL, SAFE, EMERGENCY 4가지 상태를 기반으로
+ * -배터리 소모와 온도 변화 등의 물리 법칙을 시뮬레이션 수행. (온도 60도 초과 시 자율 EMERGENCY 돌입)
+ * 2. Store & Forward (로깅 및 덤프): 우주 방사선 등으로 인한 통신 단절(LOS) 발생 시,
+ * -텔레메트리(TM) 데이터를 버리지 않고 플래시 메모리(Queue)에 저장했다가 통신 복구(AOS) 시 일괄 전송.
+ * 3. 무결성 검증: CRC-16-XMODEM 알고리즘을 사용하여 패킷의 변조 및 오류를 검사.
+ * * [Thread 구조]
+ * - Main Thread (명령 수신): 지상국으로부터 TC(Telecommand)를 수신하고 검증 후 FSM 상태를 변경.
+ * - TM Thread (상태 관리): 1초 주기로 위성의 물리적 상태를 갱신하고 TM 패킷을 생성하여 발송(또는 저장).
+ * - Orbit Simulation Thread (궤도 비행): 1초마다 위성의 궤도 각도를 변경하며, 지상국 가시권에 따른 LOS/AOS 구현.
  */
 @Slf4j
 public class SatelliteOBC {
@@ -19,17 +30,24 @@ public class SatelliteOBC {
 
 	private static volatile InetAddress lastClientAddress = null;
 	private static volatile int lastClientPort = 0;
-	private static short tmSeq = 1; 	// TM 전용 sequence
+	private static short tmSeq = 1;    // TM 전용 sequence
 
-	private static volatile short battery = 100;		// 100%
-	private static volatile short temperature = 15;		// 15도
+	private static volatile short battery = 100;      	  // 100%
+	private static volatile short temperature = 15;       // 15도
 
 	// 통신 두절 시 데이터를 보관할 플래시 메모리 (Queue)
 	private static final Queue<byte[]> flashMemory = new ConcurrentLinkedQueue<>();
 	private static final int MAX_MEMORY_CAPACITY = 100; // 최대 100개의 패킷만 보관
-	// 비정기적 통신 상태 시뮬레이션을 위한 변수
-	private static volatile boolean isCommunicationLost = false;
-	private static final Random random = new Random();
+
+	// 궤도 기반 통신 단절 추적 변수
+	private static volatile boolean isCommunicationLost = true; // 처음에는 지상국 범위를 모름(LOS로 시작)
+
+	// 궤도 시뮬레이션 관련 전역 변수 & 상수
+	private static volatile double currentOrbitAngle = 0.0; // 현재 궤도 각도 (0 ~ 359도)
+	private static final double ORBIT_SPEED_PER_SEC = 6.0;  // 1초당 이동 각도 (60초 지구 1바퀴 : 360도)
+	private static final double GS_START_ANGLE = 120.0;     // 지상국 통신 가능 시작 각도 (AOS 진입)
+	private static final double GS_END_ANGLE = 240.0;       // 지상국 통신 가능 종료 각도 (LOS 진입)
+	private static volatile boolean wasInCoverage = false;  // 이전 초의 통신 상태 추적용 (AOS/LOS 전환 감지)
 
 	// 응답 패킷 전송용 메서드 추가 (ACK or NAK)
 	private static void sendResponse(DatagramSocket socket, InetAddress clientAddress, int clientPort, short seq, boolean isAck) {
@@ -40,11 +58,11 @@ public class SatelliteOBC {
 			ByteBuffer buffer = ByteBuffer.wrap(header);
 			buffer.order(ByteOrder.BIG_ENDIAN);
 
-			buffer.putShort((short) 0xCAFE); 			// Magic
-			buffer.put((byte) 0x01);         			// Ver
-			buffer.put((byte) (isAck ? 0x00 : 0xFF)); 	// 응답 Type: 참이면 0x00(ACK), 거짓이면 0xFF(NAK)
-			buffer.putShort(seq);            			// 받은 Sequence 그대로 반환
-			buffer.putShort((short) 0);      			// Payload Length
+			buffer.putShort((short) 0xCAFE);         // Magic
+			buffer.put((byte) 0x01);                 // Ver
+			buffer.put((byte) (isAck ? 0x00 : 0xFF));  // 응답 Type: 참이면 0x00(ACK), 거짓이면 0xFF(NAK)
+			buffer.putShort(seq);                    // 받은 Sequence 그대로 반환
+			buffer.putShort((short) 0);              // Payload Length
 
 			// CRC 계산
 			int crc = Crc16Utils.calculateCrc16Xmodem(header, 8);
@@ -73,16 +91,20 @@ public class SatelliteOBC {
 		buffer.order(ByteOrder.BIG_ENDIAN);
 		buffer.putShort((short) 0xCAFE);
 		buffer.put((byte) 0x01);
-		buffer.put((byte) 0x05);
+		buffer.put((byte) 0x05);      // TM : 위성 상태보고
 		buffer.putShort(tmSeq++);
-		buffer.putShort((short) 5);
 
-		ByteBuffer packetBuffer = ByteBuffer.allocate(15);
+		// Payload 길이: 기존 5 bytes -> 7 bytes (각도 2 bytes 추가)
+		buffer.putShort((short) 7);
+
+		// 전체 패킷 크기: 헤더 8 + 페이로드 7 + CRC 2 = 17 bytes
+		ByteBuffer packetBuffer = ByteBuffer.allocate(17);
 		packetBuffer.order(ByteOrder.BIG_ENDIAN);
 		packetBuffer.put(header);
 		packetBuffer.putShort(battery);
 		packetBuffer.putShort(temperature);
 
+		// 1 byte : FSM 상태를 바이트로 변환해서 Payload 데이터에 담음
 		byte modeByte = switch (currentState) {
 			case BOOT -> 0x40;
 			case SAFE -> 0x10;
@@ -91,7 +113,11 @@ public class SatelliteOBC {
 		};
 		packetBuffer.put(modeByte);
 
-		int crc = Crc16Utils.calculateCrc16Xmodem(packetBuffer.array(), 13);
+		// 현재 궤도 각도를 페이로드에 포함 (short 타입으로 변환하여 2 bytes 차지)
+		packetBuffer.putShort((short) currentOrbitAngle);
+
+		// CRC 계산 길이 변경: 헤더 8 + 페이로드 7 = 15 bytes
+		int crc = Crc16Utils.calculateCrc16Xmodem(packetBuffer.array(), 15);
 		packetBuffer.putShort((short) crc);
 
 		return packetBuffer.array();
@@ -103,32 +129,45 @@ public class SatelliteOBC {
 		try (DatagramSocket socket = new DatagramSocket(port)) {
 			log.info("위성 시스템 시작 - 지상국 명령 대기 중... (Port: {})", port);
 
-			Thread faultInjectionThread = new Thread(() -> {
+			// ==========================================
+			// 궤도 시뮬레이션 Thread : 기존 faultInjectionThread(랜덤 장애)를 대체
+			// ==========================================
+			Thread orbitSimulationThread = new Thread(() -> {
 				while (true) {
 					try {
-						// 10초 ~ 20초 사이 랜덤하게 정상 통신 유지
-						int normalDuration = 10000 + random.nextInt(10000);
-						Thread.sleep(normalDuration);
+						Thread.sleep(1000); // 1초 단위로 궤도 이동
 
-						log.warn("💥 [장애 발생] 우주 방사선 영향으로 일시적인 통신 단절(LOS) 발생!");
-						isCommunicationLost = true;
+						// 1. 궤도 각도 증가 및 보정 (360도 회전)
+						currentOrbitAngle += ORBIT_SPEED_PER_SEC;
+						if (currentOrbitAngle >= 360.0) {
+							currentOrbitAngle -= 360.0;
+						}
 
-						// 3초 ~ 7초 사이 랜덤하게 통신 두절 유지
-						int lostDuration = 3000 + random.nextInt(4000);
-						Thread.sleep(lostDuration);
+						// 2. 현재 각도가 지상국 통신 범위(Coverage) 안에 있는지 판별
+						boolean isInCoverage = (currentOrbitAngle >= GS_START_ANGLE && currentOrbitAngle <= GS_END_ANGLE);
 
-						log.info("📡 [장애 복구] 통신 모듈 정상화 (AOS). 연결이 복구되었습니다.");
-						isCommunicationLost = false;
+						// 3. 상태가 전환되는 순간(AOS/LOS) 감지 및 로그 출력 : 지금과 1초 전 같은 통신 범위 각도 내에 있는지 확인
+						if (isInCoverage && !wasInCoverage) {	// isInCoverage: True / wasInCoverage : False면 아래 실행
+							log.info("📡 [AOS 진입] 위성이 지상국 가시권({}~{}도)에 들어왔습니다. (현재: {}도)",
+								GS_START_ANGLE, GS_END_ANGLE, String.format("%.1f", currentOrbitAngle));
+							isCommunicationLost = false; // 통신 복구
+						} else if (!isInCoverage && wasInCoverage) {
+							log.warn("💥 [LOS 진입] 위성이 지상국 가시권을 벗어났습니다. 통신이 두절됩니다. (현재: {}도)",
+								String.format("%.1f", currentOrbitAngle));
+							isCommunicationLost = true;  // 통신 단절
+						}
+
+						wasInCoverage = isInCoverage; // 다음 초 계산을 위해 현재 상태 저장
 
 					} catch (InterruptedException e) {
 						break;
 					}
 				}
 			});
-			faultInjectionThread.setDaemon(true);
-			faultInjectionThread.start();
+			orbitSimulationThread.setDaemon(true);
+			orbitSimulationThread.start();
 
-			// TM 주기적으로 쏘는 백그라운드 스레드 시작
+			// TM 주기적으로 쏘는 백그라운드 Thread :  1초에 한 번씩 FSM 상태 업데이트 및 TM 전송
 			Thread tmThread = new Thread(() -> {
 				int bootTimer = 0;
 				while (true) {
@@ -137,9 +176,9 @@ public class SatelliteOBC {
 
 						// FSM(Finite State Machine) 상태 변경 로직
 						switch (currentState) {
-							case BOOT:
+							case BOOT: // 위성에 전원이 들어오는 최초 상태
 								bootTimer++;
-								if (bootTimer >= 3) {
+								if (bootTimer >= 3) {  // Boot 상태에서 3초 대기 후 NOMINAL 모드로 전환
 									log.info("💻 [FSM] 시스템 부팅 완료. NOMINAL 모드로 자율 전환.");
 									currentState = SatelliteState.NOMINAL;
 								}
@@ -167,12 +206,13 @@ public class SatelliteOBC {
 						if (lastClientAddress != null) {
 							byte[] currentTmData = buildTelemetryPacket(); // 1초마다 데이터 생성
 
-							// 통신 상태에 따른 처리 분기
+							// AOS & LOS 상태에 따른 TM 통신 처리 분기
 							if (isCommunicationLost) {
 								// 1. 통신 두절 (LOS) 상태: 전송하지 않고 메모리에 저장만 함
 								if (flashMemory.size() < MAX_MEMORY_CAPACITY) {
 									flashMemory.offer(currentTmData);
-									log.info("💾 [로깅 중] 전송 불가. 패킷을 플래시 메모리에 저장합니다. (저장된 개수: {})", flashMemory.size());
+									log.info("💾 [로깅 중] 전송 불가(LOS). 플래시 메모리에 저장합니다. (저장된 개수: {}, 궤도: {}도)",
+										flashMemory.size(), (int)currentOrbitAngle);
 								} else {
 									flashMemory.poll(); // 꽉 찼으면 오래된 TM 메세지 삭제
 									flashMemory.offer(currentTmData);
@@ -205,12 +245,13 @@ public class SatelliteOBC {
 
 			byte[] receiveBuffer = new byte[1024];
 
+			// 지상국에서 전송하는 TC Packet을 받아 Magic byte와 CRC 확인 후 처리(currentState 변경 & Ack 전송)
 			while (true) {
 				DatagramPacket packet = new DatagramPacket(receiveBuffer, receiveBuffer.length);
 				socket.receive(packet); // 여기서 패킷이 올 때까지 기다림
 
 				// 패킷을 보낸 지상국의 IP와 포트 번호 확보 (답장할 주소 : ACK or NAK)
-				// 지상국 주소 업데이트 (이제 백그라운드 스레드도 이 주소를 보고 텔레메트리를 전송)
+				// 지상국 주소 업데이트 (이제 백그라운드 스레드도 이 주소를 보고 TM 전송)
 				lastClientAddress = packet.getAddress();
 				lastClientPort = packet.getPort();
 
@@ -218,13 +259,13 @@ public class SatelliteOBC {
 				ByteBuffer buffer = ByteBuffer.wrap(packet.getData(), packet.getOffset(), packet.getLength()); //패킷에 들어온 데이터 길이만큼만 사용
 				buffer.order(ByteOrder.BIG_ENDIAN);
 
-				short magic = buffer.getShort();	// 2byte만 읽음 : 지상국과의 통신인지 0xCAFE인지 확인
+				short magic = buffer.getShort();   // 2byte만 읽음 : 지상국과의 통신인지 0xCAFE인지 확인
 				if (magic != (short) 0xCAFE) {
 					log.warn("잘못된 Magic Number 수신됨: 0x{}", Integer.toHexString(magic & 0xFFFF));
 					continue;
 				}
 
-				// 수신된 데이터 전체에서 8바이트(헤더)만 잘라서 CRC 계산 ---
+				// 수신된 데이터 전체에서 8바이트(헤더)만 잘라서 CRC 계산
 				byte[] rawData = packet.getData();
 				int calculatedCrc = Crc16Utils.calculateCrc16Xmodem(rawData, 8); // 앞의 8바이트만 계산
 
@@ -235,7 +276,7 @@ public class SatelliteOBC {
 
 				// 지상국이 보낸 CRC 추출 및 비교
 				// 현재 버퍼의 포인터는 8번 인덱스를 가리키고 있으므로, 바로 getShort()를 하면 CRC 2바이트를 읽는다.
-				short receivedCrcShort = buffer.getShort();	//getShort()는 2바이트를 읽어 CRC 2 바이트를 저장
+				short receivedCrcShort = buffer.getShort();    //getShort()는 2바이트를 읽어 CRC 2 바이트를 저장
 				int receivedCrc = receivedCrcShort & 0xFFFF; // 부호 문제 방지 위해 int로 변환
 
 				log.info("--- 패킷 검증 ---");
@@ -250,7 +291,7 @@ public class SatelliteOBC {
 
 				// 통신 두절 시뮬레이션 중에는 지상국 명령(TC)도 무시
 				if (isCommunicationLost) {
-					log.warn("🚫 [통신 단절] 수신된 명령(Seq:{})을 처리할 수 없습니다.", seq);
+					log.warn("🚫 [LOS 상태] 궤도 이탈로 인해 수신된 명령(Seq:{})을 처리할 수 없습니다.", seq);
 					continue;
 				}
 
