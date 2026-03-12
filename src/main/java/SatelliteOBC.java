@@ -9,19 +9,20 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * 우주 위성 온보드 컴퓨터(OBC, On-Board Computer) 시뮬레이터 서버
- * -UDP 소켓 통신을 기반으로 지상국과 데이터를 주고받으며, 우주 환경의 물리적 제약과
- * -통신 장애 상황을 모사하는 3개의 독립적인 스레드로 구성.
- * * [핵심 기능]
+ * 우주 위성 온보드 컴퓨터(OBC, On-Board Computer) 시뮬레이터 서버 [V2.1]
+ * - UDP 소켓 통신을 기반으로 지상국과 데이터를 주고받으며, 우주 환경의 물리적 제약과
+ * - 통신 장애 상황을 모사.
+ * * * [핵심 기능]
  * 1. FSM (유한 상태 머신): BOOT, NOMINAL, SAFE, EMERGENCY 4가지 상태를 기반으로
- * -배터리 소모와 온도 변화 등의 물리 법칙을 시뮬레이션 수행. (온도 60도 초과 시 자율 EMERGENCY 돌입)
+ * - 배터리 소모와 온도 변화 등의 물리 법칙을 시뮬레이션 수행. (온도 60도 초과 시 자율 EMERGENCY 돌입)
  * 2. Store & Forward (로깅 및 덤프): 우주 방사선 등으로 인한 통신 단절(LOS) 발생 시,
- * -텔레메트리(TM) 데이터를 버리지 않고 플래시 메모리(Queue)에 저장했다가 통신 복구(AOS) 시 일괄 전송.
+ * - 텔레메트리(TM) 데이터를 버리지 않고 플래시 메모리(Queue)에 저장했다가 통신 복구(AOS) 시 일괄 전송.
  * 3. 무결성 검증: CRC-16-XMODEM 알고리즘을 사용하여 패킷의 변조 및 오류를 검사.
- * * [Thread 구조]
- * - Main Thread (명령 수신): 지상국으로부터 TC(Telecommand)를 수신하고 검증 후 FSM 상태를 변경.
- * - TM Thread (상태 관리): 1초 주기로 위성의 물리적 상태를 갱신하고 TM 패킷을 생성하여 발송(또는 저장).
- * - Orbit Simulation Thread (궤도 비행): 1초마다 위성의 궤도 각도를 변경하며, 지상국 가시권에 따른 LOS/AOS 구현.
+ * * * [V2.1 업데이트 사항]
+ * - 기존 분리되어 있던 궤도 스레드를 TM 스레드로 통합하여 데이터 갱신 타이밍 완벽 동기화.
+ * - 0도 경계선(Wrap-around) 문제 해결을 위해 '중심각 최단 거리(Angular Difference)' 로직 도입.
+ * - 대역폭 최적화를 위해 궤도 각도에 *10 스케일링을 적용하여 short(2바이트)로 캐스팅하여 전송.
+ * - 서버 기동 시 초기 궤도 각도를 기반으로 통신 상태(AOS/LOS) 자동 동적 초기화.
  */
 @Slf4j
 public class SatelliteOBC {
@@ -32,22 +33,39 @@ public class SatelliteOBC {
 	private static volatile int lastClientPort = 0;
 	private static short tmSeq = 1;    // TM 전용 sequence
 
-	private static volatile short battery = 100;      	  // 100%
+	private static volatile short battery = 100;         // 100%
 	private static volatile short temperature = 15;       // 15도
 
 	// 통신 두절 시 데이터를 보관할 플래시 메모리 (Queue)
 	private static final Queue<byte[]> flashMemory = new ConcurrentLinkedQueue<>();
 	private static final int MAX_MEMORY_CAPACITY = 100; // 최대 100개의 패킷만 보관
 
-	// 궤도 기반 통신 단절 추적 변수
-	private static volatile boolean isCommunicationLost = true; // 처음에는 지상국 범위를 모름(LOS로 시작)
-
-	// 궤도 시뮬레이션 관련 전역 변수 & 상수
-	private static volatile double currentOrbitAngle = 0.0; // 현재 궤도 각도 (0 ~ 359도)
+	// ==========================================
+	// 궤도 시뮬레이션 전역 변수 & 상수
+	// ==========================================
 	private static final double ORBIT_SPEED_PER_SEC = 6.0;  // 1초당 이동 각도 (60초 지구 1바퀴 : 360도)
-	private static final double GS_START_ANGLE = 120.0;     // 지상국 통신 가능 시작 각도 (AOS 진입)
-	private static final double GS_END_ANGLE = 240.0;       // 지상국 통신 가능 종료 각도 (LOS 진입)
-	private static volatile boolean wasInCoverage = false;  // 이전 초의 통신 상태 추적용 (AOS/LOS 전환 감지)
+	private static final double GS_CENTER_ANGLE = 180.0;    // 지상국 정점(중심) 각도
+	private static final double VISIBILITY_HALF_ANGLE = 60.0; // 가시권 반각 (앞뒤 60도, 즉 120~240도 구간)
+
+	// 1. 초기 궤도 각도 설정 (시작하자마자 통신을 확인하기 위해 175도로 세팅)
+	private static volatile double currentOrbitAngle = 175.0;
+
+	// 2. 초기 각도를 바탕으로 과거 가시권 상태 세팅 (동적 초기화)
+	private static volatile boolean wasInCoverage = calculateInitialCoverage(currentOrbitAngle);
+
+	// 3. 궤도 기반 통신 단절 추적 변수 (가시권 상태에 맞춰 논리적 동기화)
+	private static volatile boolean isCommunicationLost = !wasInCoverage;
+
+	// 두 각도 사이의 최단 거리 계산 (360도 경계를 부드럽게 넘어감)
+	private static double angularDifference(double a, double b) {
+		double diff = Math.abs(a - b) % 360.0;
+		return diff > 180.0 ? 360.0 - diff : diff;
+	}
+
+	// 초기 상태 계산을 위한 헬퍼 함수
+	private static boolean calculateInitialCoverage(double orbitAngle) {
+		return angularDifference(orbitAngle, GS_CENTER_ANGLE) <= VISIBILITY_HALF_ANGLE;
+	}
 
 	// 응답 패킷 전송용 메서드 추가 (ACK or NAK)
 	private static void sendResponse(DatagramSocket socket, InetAddress clientAddress, int clientPort, short seq, boolean isAck) {
@@ -94,7 +112,7 @@ public class SatelliteOBC {
 		buffer.put((byte) 0x05);      // TM : 위성 상태보고
 		buffer.putShort(tmSeq++);
 
-		// Payload 길이: 기존 5 bytes -> 7 bytes (각도 2 bytes 추가)
+		// Payload 길이: 기존 5 bytes -> 7 bytes (각도 2 bytes 추가 유지)
 		buffer.putShort((short) 7);
 
 		// 전체 패킷 크기: 헤더 8 + 페이로드 7 + CRC 2 = 17 bytes
@@ -113,8 +131,9 @@ public class SatelliteOBC {
 		};
 		packetBuffer.put(modeByte);
 
-		// 현재 궤도 각도를 페이로드에 포함 (short 타입으로 변환하여 2 bytes 차지)
-		packetBuffer.putShort((short) currentOrbitAngle);
+		// [V2.1 최적화] Scaling: 소수점 이하를 살리기 위해 10을 곱한 뒤 short(2 bytes)로 캐스팅하여 전송
+		short scaledAngle = (short) Math.round(currentOrbitAngle * 10.0);
+		packetBuffer.putShort(scaledAngle);
 
 		// CRC 계산 길이 변경: 헤더 8 + 페이로드 7 = 15 bytes
 		int crc = Crc16Utils.calculateCrc16Xmodem(packetBuffer.array(), 15);
@@ -128,53 +147,40 @@ public class SatelliteOBC {
 
 		try (DatagramSocket socket = new DatagramSocket(port)) {
 			log.info("위성 시스템 시작 - 지상국 명령 대기 중... (Port: {})", port);
+			log.info("초기 궤도 세팅: {}도 (통신 단절 여부: {})", currentOrbitAngle, isCommunicationLost);
 
-			// ==========================================
-			// 궤도 시뮬레이션 Thread : 기존 faultInjectionThread(랜덤 장애)를 대체
-			// ==========================================
-			Thread orbitSimulationThread = new Thread(() -> {
+			// TM 주기적으로 쏘는 백그라운드 Thread : 1초에 한 번씩 궤도 갱신, FSM 업데이트 및 TM 전송 (스레드 통합)
+			Thread tmThread = new Thread(() -> {
+				int bootTimer = 0;
 				while (true) {
 					try {
-						Thread.sleep(1000); // 1초 단위로 궤도 이동
+						Thread.sleep(1000); // 1초 대기 (1 Tick)
 
+						// ========================================================
+						// 1. 궤도 시뮬레이션 로직 (우선 실행)
+						// ========================================================
 						// 1. 궤도 각도 증가 및 보정 (360도 회전)
 						currentOrbitAngle += ORBIT_SPEED_PER_SEC;
 						if (currentOrbitAngle >= 360.0) {
 							currentOrbitAngle -= 360.0;
 						}
 
-						// 2. 현재 각도가 지상국 통신 범위(Coverage) 안에 있는지 판별
-						boolean isInCoverage = (currentOrbitAngle >= GS_START_ANGLE && currentOrbitAngle <= GS_END_ANGLE);
+						// 2. 현재 각도가 지상국 통신 범위(Coverage) 안에 있는지 판별 (최단 거리 공식 활용)
+						boolean isInCoverage = angularDifference(currentOrbitAngle, GS_CENTER_ANGLE) <= VISIBILITY_HALF_ANGLE;
 
 						// 3. 상태가 전환되는 순간(AOS/LOS) 감지 및 로그 출력 : 지금과 1초 전 같은 통신 범위 각도 내에 있는지 확인
-						if (isInCoverage && !wasInCoverage) {	// isInCoverage: True / wasInCoverage : False면 아래 실행
-							log.info("📡 [AOS 진입] 위성이 지상국 가시권({}~{}도)에 들어왔습니다. (현재: {}도)",
-								GS_START_ANGLE, GS_END_ANGLE, String.format("%.1f", currentOrbitAngle));
+						if (isInCoverage && !wasInCoverage) {  // isInCoverage: True / wasInCoverage : False면 아래 실행
+							log.info("📡 [AOS 진입] 위성이 지상국 가시권에 진입했습니다. (현재: {}도)", String.format("%.1f", currentOrbitAngle));
 							isCommunicationLost = false; // 통신 복구
 						} else if (!isInCoverage && wasInCoverage) {
-							log.warn("💥 [LOS 진입] 위성이 지상국 가시권을 벗어났습니다. 통신이 두절됩니다. (현재: {}도)",
-								String.format("%.1f", currentOrbitAngle));
+							log.warn("💥 [LOS 진입] 위성이 지상국 가시권을 벗어났습니다. 통신이 두절됩니다. (현재: {}도)", String.format("%.1f", currentOrbitAngle));
 							isCommunicationLost = true;  // 통신 단절
 						}
-
 						wasInCoverage = isInCoverage; // 다음 초 계산을 위해 현재 상태 저장
 
-					} catch (InterruptedException e) {
-						break;
-					}
-				}
-			});
-			orbitSimulationThread.setDaemon(true);
-			orbitSimulationThread.start();
-
-			// TM 주기적으로 쏘는 백그라운드 Thread :  1초에 한 번씩 FSM 상태 업데이트 및 TM 전송
-			Thread tmThread = new Thread(() -> {
-				int bootTimer = 0;
-				while (true) {
-					try {
-						Thread.sleep(1000); // 1초 대기
-
-						// FSM(Finite State Machine) 상태 변경 로직
+						// ========================================================
+						// 2. FSM(Finite State Machine) 상태 변경 로직
+						// ========================================================
 						switch (currentState) {
 							case BOOT: // 위성에 전원이 들어오는 최초 상태
 								bootTimer++;
@@ -202,6 +208,10 @@ public class SatelliteOBC {
 								temperature = (short) Math.max(-10, temperature - 5);
 								break;
 						}
+
+						// ========================================================
+						// 3. TM(Telemetry) 전송 및 로깅 로직
+						// ========================================================
 						// 지상국에서 데이터를 전송하여 주소를 알 때만 TM 전송.
 						if (lastClientAddress != null) {
 							byte[] currentTmData = buildTelemetryPacket(); // 1초마다 데이터 생성
@@ -212,7 +222,7 @@ public class SatelliteOBC {
 								if (flashMemory.size() < MAX_MEMORY_CAPACITY) {
 									flashMemory.offer(currentTmData);
 									log.info("💾 [로깅 중] 전송 불가(LOS). 플래시 메모리에 저장합니다. (저장된 개수: {}, 궤도: {}도)",
-										flashMemory.size(), (int)currentOrbitAngle);
+										flashMemory.size(), String.format("%.1f", currentOrbitAngle));
 								} else {
 									flashMemory.poll(); // 꽉 찼으면 오래된 TM 메세지 삭제
 									flashMemory.offer(currentTmData);
