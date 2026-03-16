@@ -198,19 +198,31 @@ public class SatelliteOBC {
 								battery = (short) Math.max(0, battery - 4);
 								temperature = (short) Math.min(80, temperature + 4);
 
-								if (temperature >= 60) {
-									log.error("🔥 [FSM] 임계 온도 초과! 시스템 보호를 위해 EMERGENCY 모드로 강제 전환");
+								// 배터리가 매우 낮거나 온도가 매우 높을때 EMERGENCY로 전환
+								if (temperature >= 60 || battery <= 5) {
+									log.error("🔥/🪫 [FSM] 치명적 위기 감지 (온도:{}도, 배터리:{}%)! 시스템 보호를 위해 EMERGENCY 강제 전환", temperature, battery);
 									currentState = SatelliteState.EMERGENCY;
+								}
+								// 배터리 저전압 감지
+								else if (battery <= 20) {
+									log.warn("⚠️ [FSM] 배터리 저전압 감지 ({}%)! 태양광 충전을 위해 자율 SAFE 모드 전환", battery);
+									currentState = SatelliteState.SAFE;
 								}
 								break;
 							case EMERGENCY:
-								// 시스템은 꺼져있지만 태양광 패널로 인해 배터리 충전
+								// 시스템은 꺼져있지만 태양광 패널로 인해 배터리 충전 : EMERGENCY에서 SAFE나 NOMINAL로의 복구는 지상국 명령(TC)으로만
 								battery = (short) Math.min(100, battery + 1);
 								temperature = (short) Math.max(-10, temperature - 5);
 								break;
 							case SAFE:
 								battery = (short) Math.min(100, battery + 5);
 								temperature = (short) Math.max(-10, temperature - 3);
+
+								// SAFE 모드 중에도 우주 환경에 의해 배터리가 더 닳을 수 있음을 방어
+								if (battery <= 5) {
+									log.error("🪫 [FSM] SAFE 모드 중 배터리 치명적 고갈 ({}%)! EMERGENCY 강제 전환", battery);
+									currentState = SatelliteState.EMERGENCY;
+								}
 								break;
 						}
 
@@ -320,12 +332,12 @@ public class SatelliteOBC {
              log.info("Payload Length: {}", len);
              log.info("======================================");*/
 
-				if (type == (byte) 0x10) {
+				if (type == (byte) 0x10) {			 				// 0x10=SAFE
 					if (currentState != SatelliteState.SAFE) {
 						currentState = SatelliteState.SAFE;
 						log.info("📡 [TC] 지상국 명령: SAFE 모드 전환.");
 					}
-				} else if (type == (byte) 0x20) {
+				} else if (type == (byte) 0x20) {					// 0x20=NOMINAL
 					if (currentState != SatelliteState.NOMINAL) {
 						currentState = SatelliteState.NOMINAL;
 						log.info("📡 [TC] 지상국 명령: NOMINAL 모드 전환.");
