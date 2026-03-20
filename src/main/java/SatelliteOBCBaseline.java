@@ -10,31 +10,26 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * 위성 OBC 시뮬레이터 서버 [ARQ 적용 + 실험 시작 동기화 버전]
- *
+ * 위성 OBC 시뮬레이터 서버 [Baseline UDP 비교군 + 실험 시작 동기화 버전]
  * 목적:
- * - Stop-and-Wait ARQ 적용 버전
- * - 실험 반복성을 위해 첫 Ping(또는 최초 유효 TC) 수신 전까지 시뮬레이션 시간 정지
- *
+ * - ARQ 미적용 상태의 순수 UDP 제어 성능을 측정하기 위한 비교군
+ * - 실험 반복성을 위해 첫 Ping(또는 최초 유효 TC) 수신 전까지 시뮬레이션 시간을 정지
  * 특징:
  * - Ping(0x0F) 허용
  * - 30% 무응답 fault injection 포함
- * - Seq + Type 기반 중복 방어
  * - LOS/AOS + PB dump 유지
  * - RT/PB TM payload 7바이트 유지
+ * - 재전송 없음
+ * - 중복 방어 없음
  */
 @Slf4j
-public class ARQSatelliteOBC {
+public class SatelliteOBCBaseline {
 
 	private static volatile SatelliteState currentState = SatelliteState.BOOT;
 
 	private static volatile InetAddress lastClientAddress = null;
 	private static volatile int lastClientPort = 0;
 	private static short tmSeq = 1; // TM 전용 sequence
-
-	// ARQ 중복 방어용
-	private static short lastProcessedTcSeq = -1;
-	private static byte lastProcessedTcType = (byte) 0x00;
 
 	private static volatile short battery = 100;      // 100%
 	private static volatile short temperature = 15;   // 15도
@@ -127,24 +122,12 @@ public class ARQSatelliteOBC {
 		packetBuffer.putShort(battery);
 		packetBuffer.putShort(temperature);
 
-		byte modeByte;
-		switch (currentState) {
-			case BOOT:
-				modeByte = 0x40;
-				break;
-			case SAFE:
-				modeByte = 0x10;
-				break;
-			case EMERGENCY:
-				modeByte = 0x30;
-				break;
-			case NOMINAL:
-				modeByte = 0x20;
-				break;
-			default:
-				modeByte = 0x40;
-				break;
-		}
+		byte modeByte = switch (currentState) {
+			case BOOT -> 0x40;
+			case SAFE -> 0x10;
+			case EMERGENCY -> 0x30;
+			case NOMINAL -> 0x20;
+		};
 		packetBuffer.put(modeByte);
 
 		short scaledAngle = (short) Math.round(currentOrbitAngle * 10.0);
@@ -165,118 +148,7 @@ public class ARQSatelliteOBC {
 				currentOrbitAngle, currentState, battery, temperature);
 			log.info("첫 Ping(또는 최초 유효 TC) 수신 전까지 시뮬레이션 시간은 정지합니다.");
 
-			Thread tmThread = new Thread(() -> {
-				int bootTimer = 0;
-
-				while (true) {
-					try {
-						Thread.sleep(1000);
-
-						// 실험 시작 전까지 정지
-						if (!simulationStarted) {
-							continue;
-						}
-
-						// 1) 궤도 갱신
-						currentOrbitAngle += ORBIT_SPEED_PER_SEC;
-						if (currentOrbitAngle >= 360.0) {
-							currentOrbitAngle -= 360.0;
-						}
-
-						// 2) 가시권 판정
-						boolean isInCoverage =
-							angularDifference(currentOrbitAngle, GS_CENTER_ANGLE) <= VISIBILITY_HALF_ANGLE;
-
-						if (isInCoverage && !wasInCoverage) {
-							log.info("📡 [AOS 진입] 위성이 지상국 가시권에 진입했습니다. (현재: {}도)",
-								String.format("%.1f", currentOrbitAngle));
-							isCommunicationLost = false;
-						} else if (!isInCoverage && wasInCoverage) {
-							log.warn("💥 [LOS 진입] 위성이 지상국 가시권을 벗어났습니다. 통신이 두절됩니다. (현재: {}도)",
-								String.format("%.1f", currentOrbitAngle));
-							isCommunicationLost = true;
-						}
-						wasInCoverage = isInCoverage;
-
-						// 3) FSM 상태 변경
-						switch (currentState) {
-							case BOOT:
-								bootTimer++;
-								if (bootTimer >= 3) {
-									log.info("💻 [FSM] 시스템 부팅 완료. NOMINAL 모드로 자율 전환.");
-									currentState = SatelliteState.NOMINAL;
-								}
-								break;
-
-							case NOMINAL:
-								battery = (short) Math.max(0, battery - 4);
-								temperature = (short) Math.min(80, temperature + 4);
-
-								if (temperature >= 60 || battery <= 5) {
-									log.error("🔥/🪫 [FSM] 치명적 위기 감지 (온도:{}도, 배터리:{}%)! 시스템 보호를 위해 EMERGENCY 강제 전환",
-										temperature, battery);
-									currentState = SatelliteState.EMERGENCY;
-								} else if (battery <= 20) {
-									log.warn("⚠️ [FSM] 배터리 저전압 감지 ({}%)! 태양광 충전을 위해 자율 SAFE 모드 전환", battery);
-									currentState = SatelliteState.SAFE;
-								}
-								break;
-
-							case EMERGENCY:
-								battery = (short) Math.min(100, battery + 1);
-								temperature = (short) Math.max(-10, temperature - 5);
-								break;
-
-							case SAFE:
-								battery = (short) Math.min(100, battery + 5);
-								temperature = (short) Math.max(-10, temperature - 3);
-
-								if (battery <= 5) {
-									log.error("🪫 [FSM] SAFE 모드 중 배터리 치명적 고갈 ({}%)! EMERGENCY 강제 전환", battery);
-									currentState = SatelliteState.EMERGENCY;
-								}
-								break;
-						}
-
-						// 4) TM 전송 / PB 저장 및 dump
-						if (lastClientAddress != null) {
-							if (isCommunicationLost) {
-								byte[] pbTmData = buildTelemetryPacket(false);
-
-								if (flashMemory.size() < MAX_MEMORY_CAPACITY) {
-									flashMemory.offer(pbTmData);
-									log.info("💾 [로깅 중] 전송 불가(LOS). 플래시 메모리에 저장합니다. (저장된 개수: {}, 궤도: {}도)",
-										flashMemory.size(), String.format("%.1f", currentOrbitAngle));
-								} else {
-									flashMemory.poll();
-									flashMemory.offer(pbTmData);
-								}
-							} else {
-								while (!flashMemory.isEmpty()) {
-									byte[] dumpData = flashMemory.poll();
-									DatagramPacket dumpPacket =
-										new DatagramPacket(dumpData, dumpData.length, lastClientAddress, lastClientPort);
-									socket.send(dumpPacket);
-									log.info("📥 [DUMP] 저장된 과거 TM 데이터를 전송합니다. (남은 데이터: {})", flashMemory.size());
-									Thread.sleep(50);
-								}
-
-								byte[] rtTmData = buildTelemetryPacket(true);
-								DatagramPacket tmPacket =
-									new DatagramPacket(rtTmData, rtTmData.length, lastClientAddress, lastClientPort);
-								socket.send(tmPacket);
-							}
-						}
-
-					} catch (InterruptedException e) {
-						break;
-					} catch (Exception e) {
-						log.error("TM 스레드 오류", e);
-					}
-				}
-			});
-
-			tmThread.setDaemon(true);
+			Thread tmThread = getTmThread(socket);
 			tmThread.start();
 
 			byte[] receiveBuffer = new byte[1024];
@@ -358,6 +230,7 @@ public class ARQSatelliteOBC {
 				}
 
 				// LOS 상태에서는 명령 처리 불가
+				// 단, 주소 학습/시뮬레이션 시작은 이미 위에서 끝났음
 				if (isCommunicationLost) {
 					log.warn("🚫 [LOS 상태] 궤도 이탈로 인해 수신된 명령(Seq:{})을 처리할 수 없습니다.", seq);
 					continue;
@@ -365,36 +238,24 @@ public class ARQSatelliteOBC {
 
 				// [비교 실험용] 30% 확률 의도적 무응답
 				if (Math.random() < 0.30) {
-					log.warn("🌌 [Uplink Command Loss] 30% 확률 의도적 무응답 모사 - TC 패킷(Seq:{}) 무시", seq);
+					log.warn("🌌 [Uplink Loss] 무선 노이즈로 인해 TC 패킷(Seq:{})이 유실되었습니다.", seq);
 					continue;
 				}
 
-				// ARQ 핵심: 이미 처리한 동일 Seq + Type이면 상태 변경 없이 ACK만 재전송
-				if (seq == lastProcessedTcSeq && type == lastProcessedTcType) {
-					log.info("🔄 [ARQ 중복 수신] 이미 처리된 TC 패킷(Seq:{}, Type:0x{})입니다. ACK만 재전송합니다.",
-						seq, String.format("%02X", type & 0xFF));
-					sendResponse(socket, lastClientAddress, lastClientPort, seq, true);
-					continue;
-				}
-
-				// FSM 상태 변경 처리
+				// Baseline: 중복 방어 없음
 				if (type == (byte) 0x0F) {
 					log.info("📡 [TC] 지상국 연결 확인 (Ping) 수신. FSM 상태 유지.");
 				} else if (type == (byte) 0x10) {
 					if (currentState != SatelliteState.SAFE) {
 						currentState = SatelliteState.SAFE;
-						log.info("📡 [TC] 지상국 명령 수락: SAFE 모드 전환.");
+						log.info("📡 [TC] 지상국 명령: SAFE 모드 전환.");
 					}
 				} else if (type == (byte) 0x20) {
 					if (currentState != SatelliteState.NOMINAL) {
 						currentState = SatelliteState.NOMINAL;
-						log.info("📡 [TC] 지상국 명령 수락: NOMINAL 모드 전환.");
+						log.info("📡 [TC] 지상국 명령: NOMINAL 모드 전환.");
 					}
 				}
-
-				// 정상 처리 완료 기록
-				lastProcessedTcSeq = seq;
-				lastProcessedTcType = type;
 
 				log.info("현재 위성 상태: [{}]", currentState);
 				sendResponse(socket, lastClientAddress, lastClientPort, seq, true);
@@ -403,5 +264,122 @@ public class ARQSatelliteOBC {
 		} catch (Exception e) {
 			log.error("위성 메인 루프에서 예외 발생: ", e);
 		}
+	}
+
+	private static Thread getTmThread(DatagramSocket socket) {
+		Thread tmThread = new Thread(() -> {
+			int bootTimer = 0;
+
+			while (true) {
+				try {
+					Thread.sleep(1000);
+
+					// 실험 시작 동기화:
+					// 첫 Ping(또는 최초 유효 TC) 수신 전까지는 아무것도 진행하지 않음
+					if (!simulationStarted) {
+						continue;
+					}
+
+					// 1) 궤도 갱신
+					currentOrbitAngle += ORBIT_SPEED_PER_SEC;
+					if (currentOrbitAngle >= 360.0) {
+						currentOrbitAngle -= 360.0;
+					}
+
+					// 2) 가시권 판정
+					boolean isInCoverage =
+						angularDifference(currentOrbitAngle, GS_CENTER_ANGLE) <= VISIBILITY_HALF_ANGLE;
+
+					if (isInCoverage && !wasInCoverage) {
+						log.info("📡 [AOS 진입] 위성이 지상국 가시권에 진입했습니다. (현재: {}도)",
+							String.format("%.1f", currentOrbitAngle));
+						isCommunicationLost = false;
+					} else if (!isInCoverage && wasInCoverage) {
+						log.warn("💥 [LOS 진입] 위성이 지상국 가시권을 벗어났습니다. 통신이 두절됩니다. (현재: {}도)",
+							String.format("%.1f", currentOrbitAngle));
+						isCommunicationLost = true;
+					}
+					wasInCoverage = isInCoverage;
+
+					// 3) FSM 상태 변경
+					switch (currentState) {
+						case BOOT:
+							bootTimer++;
+							if (bootTimer >= 3) {
+								log.info("💻 [FSM] 시스템 부팅 완료. NOMINAL 모드로 자율 전환.");
+								currentState = SatelliteState.NOMINAL;
+							}
+							break;
+
+						case NOMINAL:
+							battery = (short) Math.max(0, battery - 4);
+							temperature = (short) Math.min(80, temperature + 4);
+
+							if (temperature >= 60 || battery <= 5) {
+								log.error("🔥/🪫 [FSM] 치명적 위기 감지 (온도:{}도, 배터리:{}%)! 시스템 보호를 위해 EMERGENCY 강제 전환",
+									temperature, battery);
+								currentState = SatelliteState.EMERGENCY;
+							} else if (battery <= 20) {
+								log.warn("⚠️ [FSM] 배터리 저전압 감지 ({}%)! 태양광 충전을 위해 자율 SAFE 모드 전환", battery);
+								currentState = SatelliteState.SAFE;
+							}
+							break;
+
+						case EMERGENCY:
+							battery = (short) Math.min(100, battery + 1);
+							temperature = (short) Math.max(-10, temperature - 5);
+							break;
+
+						case SAFE:
+							battery = (short) Math.min(100, battery + 5);
+							temperature = (short) Math.max(-10, temperature - 3);
+
+							if (battery <= 5) {
+								log.error("🪫 [FSM] SAFE 모드 중 배터리 치명적 고갈 ({}%)! EMERGENCY 강제 전환", battery);
+								currentState = SatelliteState.EMERGENCY;
+							}
+							break;
+					}
+
+					// 4) TM 전송 / PB 저장 및 dump
+					if (lastClientAddress != null) {
+						if (isCommunicationLost) {
+							byte[] pbTmData = buildTelemetryPacket(false);
+
+							if (flashMemory.size() < MAX_MEMORY_CAPACITY) {
+								flashMemory.offer(pbTmData);
+								log.info("💾 [로깅 중] 전송 불가(LOS). 플래시 메모리에 저장합니다. (저장된 개수: {}, 궤도: {}도)",
+									flashMemory.size(), String.format("%.1f", currentOrbitAngle));
+							} else {
+								flashMemory.poll();
+								flashMemory.offer(pbTmData);
+							}
+						} else {
+							while (!flashMemory.isEmpty()) {
+								byte[] dumpData = flashMemory.poll();
+								DatagramPacket dumpPacket =
+									new DatagramPacket(dumpData, dumpData.length, lastClientAddress, lastClientPort);
+								socket.send(dumpPacket);
+								log.info("📥 [DUMP] 저장된 과거 TM 데이터를 전송합니다. (남은 데이터: {})", flashMemory.size());
+								Thread.sleep(50);
+							}
+
+							byte[] rtTmData = buildTelemetryPacket(true);
+							DatagramPacket tmPacket =
+								new DatagramPacket(rtTmData, rtTmData.length, lastClientAddress, lastClientPort);
+							socket.send(tmPacket);
+						}
+					}
+
+				} catch (InterruptedException e) {
+					break;
+				} catch (Exception e) {
+					log.error("TM 스레드 오류", e);
+				}
+			}
+		});
+
+		tmThread.setDaemon(true);
+		return tmThread;
 	}
 }
